@@ -30,6 +30,7 @@ Usage:
 
 from pathlib import Path
 import importlib.util
+import shutil
 import wandb
 import torch
 import yaml
@@ -52,7 +53,8 @@ def load_train_config(yaml_path: Path):
 # =====================
 # Load parameters from YAML
 # =====================
-train_cfg = load_train_config("configs/train_config.yaml")
+TRAIN_CONFIG_PATH = Path("configs/train_config.yaml")
+train_cfg = load_train_config(TRAIN_CONFIG_PATH)
 DATASET_ROOT = Path(train_cfg["dataset_root"])
 REPO_ID = train_cfg["repo_id"]
 OUTPUT_DIRECTORY = Path(train_cfg["output_directory"])
@@ -138,6 +140,8 @@ def main():
                 break
 
     policy.save_pretrained(OUTPUT_DIRECTORY)
+    # Keep the training hyperparameters (lr, delta_timestamps, etc.) alongside the checkpoint
+    shutil.copy(TRAIN_CONFIG_PATH, OUTPUT_DIRECTORY / "train_config.yaml")
     print(f"policy saved to {OUTPUT_DIRECTORY}")
     wandb.finish()
 

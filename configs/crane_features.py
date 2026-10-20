@@ -17,6 +17,6 @@ features = {
 }
 # Below is used for the dataset conversion
 robot_type = "crane_plus"
-repo_id = "crane_plus_pekori"
-root = "/home/ubuntu/dataset/lerobot_dataset/crane_plus_pekori"
-task_name = "pekori"
+repo_id = "crane_plus_pick_and_move"
+root = "/workspace/dataset/lerobot_dataset/crane_plus_pick_and_move"
+task_name = "pick_and_move"

@@ -153,12 +153,13 @@ class RosbagToLeRobot:
                 g_pos_sampled = self._sample_and_hold(g_times, g_pos, target_times)  # (num_frames,)
                 # Concatenate after sampling
                 a_pos_full = np.hstack([a_pos_sampled, g_pos_sampled.reshape(-1,1)])  # (num_frames, 5)
-                for i in range(max_frames):
-                    idx_to_use = min(i, num_frames - 1)
+                # Add only this episode's own frames; LeRobot handles variable episode lengths
+                # (out-of-episode action chunk steps are masked via action_is_pad during training)
+                for i in range(num_frames):
                     self.dataset.add_frame({
-                        "observation.state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
-                        "observation.environment_state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
-                        "action": torch.tensor(a_pos_full[idx_to_use], dtype=torch.float32),
+                        "observation.state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
+                        "observation.environment_state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
+                        "action": torch.tensor(a_pos_full[i], dtype=torch.float32),
                         "task": self.task_name,
                     })
                 print(f"Saving episode {idx}...")

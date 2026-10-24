@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import cv2
 import numpy as np
 import torch
 from pathlib import Path
@@ -9,6 +10,30 @@ import yaml
 import importlib.util
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+def decode_image(msg, image_size=None):
+    """Convert a sensor_msgs/Image to an RGB uint8 array (H, W, 3), resized to image_size (height, width) if set.
+
+    Also used by infer.py so that inference applies exactly the same preprocessing as the dataset.
+    """
+    channels = {'rgb8': 3, 'bgr8': 3, 'rgba8': 4, 'bgra8': 4, 'mono8': 1}
+    if msg.encoding not in channels:
+        raise ValueError(f"Unsupported image encoding: {msg.encoding}")
+    c = channels[msg.encoding]
+    img = np.asarray(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)[:, :msg.width * c]
+    img = img.reshape(msg.height, msg.width, c)
+    if msg.encoding == 'bgr8':
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    elif msg.encoding == 'rgba8':
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+    elif msg.encoding == 'bgra8':
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    elif msg.encoding == 'mono8':
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if image_size and img.shape[:2] != tuple(image_size):
+        h, w = image_size
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    return img
 
 class RosbagToLeRobot:
     def __init__(self, bag_dir, output_dir, config_path, target_freq=None):
@@ -31,6 +56,9 @@ class RosbagToLeRobot:
             robot_type = getattr(config, "robot_type", "crane_plus")
             repo_id = getattr(config, "repo_id", "teleop_rosbag_dataset")
             task_name = getattr(config, "task_name", "teleop")
+            camera_topic = getattr(config, "camera_topic", None)
+            image_key = getattr(config, "image_key", "observation.images.camera")
+            image_size = getattr(config, "image_size", None)
         else:
             # YAML fallback
             with open(config_path, 'r') as f:
@@ -39,8 +67,20 @@ class RosbagToLeRobot:
             robot_type = config.get('robot_type', 'crane_plus')
             repo_id = config.get('repo_id', 'teleop_rosbag_dataset')
             task_name = config.get('task_name', 'teleop')
+            camera_topic = config.get('camera_topic')
+            image_key = config.get('image_key', 'observation.images.camera')
+            image_size = config.get('image_size')
 
         self.task_name = task_name
+
+        # Camera is optional: without camera_topic in the config, only joint data is converted
+        self.camera_topic = camera_topic
+        self.image_key = image_key
+        self.image_size = tuple(image_size) if image_size else None  # (height, width); None keeps the original size
+        if self.camera_topic:
+            if self.image_key not in features:
+                raise ValueError(f"'{self.image_key}' must be defined in features when camera_topic is set")
+            print(f"Camera: {self.camera_topic} -> {self.image_key}, image_size={self.image_size or 'original'}")
 
         # --- Dataset creation with user prompt if dir exists ---
         while True:
@@ -73,18 +113,46 @@ class RosbagToLeRobot:
             self.dataset.meta.add_task("teleop")
 
     def _get_messages(self, episode_dir):
-        """Get messages from all required topics in the rosbag."""
+        """Get messages from all required topics in the rosbag.
+
+        Camera messages are not deserialized here to save memory; only their timestamps are kept
+        (as (None, timestamp)). The images themselves are read later by _iter_frame_images.
+        """
         messages = {
             '/joint_states': [],
             '/crane_plus_arm_controller/joint_trajectory': [],
             '/crane_plus_gripper_controller/joint_trajectory': [],
         }
+        if self.camera_topic:
+            messages[self.camera_topic] = []
         with Reader(episode_dir) as reader:
             connections = [x for x in reader.connections if x.topic in messages.keys()]
             for connection, timestamp, rawdata in reader.messages(connections=connections):
+                if connection.topic == self.camera_topic:
+                    messages[connection.topic].append((None, timestamp))
+                    continue
                 msg = deserialize_cdr(rawdata, connection.msgtype)
                 messages[connection.topic].append((msg, timestamp))
         return messages
+
+    def _iter_frame_images(self, episode_dir, frame_image_idx):
+        """Yield one image per frame, where frame_image_idx[i] is the index of the camera message for frame i.
+
+        Reads the camera messages in order and decodes only the ones that are used,
+        so the whole episode's images never have to be held in memory.
+        """
+        f = 0
+        with Reader(episode_dir) as reader:
+            connections = [x for x in reader.connections if x.topic == self.camera_topic]
+            for i, (connection, _, rawdata) in enumerate(reader.messages(connections=connections)):
+                if f >= len(frame_image_idx):
+                    break
+                if frame_image_idx[f] != i:
+                    continue
+                img = decode_image(deserialize_cdr(rawdata, connection.msgtype), self.image_size)
+                while f < len(frame_image_idx) and frame_image_idx[f] == i:
+                    yield img
+                    f += 1
 
     def _sample_and_hold(self, times, values, target_times):
         values = np.asarray(values)
@@ -117,6 +185,10 @@ class RosbagToLeRobot:
                 # Use the intersection of available times
                 start_time = max(j_times[0], a_times[0], g_times[0])
                 end_time = min(j_times[-1], a_times[-1], g_times[-1])
+                if self.camera_topic:
+                    i_times = np.array([ts for _, ts in messages[self.camera_topic]])
+                    start_time = max(start_time, i_times[0])
+                    end_time = min(end_time, i_times[-1])
                 target_freq = self.target_freq or 20
                 num_frames = int((end_time - start_time) * target_freq / 1e9)
                 max_frames = max(max_frames, num_frames)
@@ -144,6 +216,10 @@ class RosbagToLeRobot:
                 g_pos = np.array([msg.points[0].positions[0] if (msg.points and len(msg.points[0].positions)>0) else 0.0 for msg, _ in gripper_cmds])
                 start_time = max(j_times[0], a_times[0], g_times[0])
                 end_time = min(j_times[-1], a_times[-1], g_times[-1])
+                if self.camera_topic:
+                    i_times = np.array([ts for _, ts in messages[self.camera_topic]])
+                    start_time = max(start_time, i_times[0])
+                    end_time = min(end_time, i_times[-1])
                 target_freq = self.target_freq or 20
                 num_frames = episode_lengths[idx]
                 target_times = np.linspace(start_time, end_time, num_frames)
@@ -153,15 +229,23 @@ class RosbagToLeRobot:
                 g_pos_sampled = self._sample_and_hold(g_times, g_pos, target_times)  # (num_frames,)
                 # Concatenate after sampling
                 a_pos_full = np.hstack([a_pos_sampled, g_pos_sampled.reshape(-1,1)])  # (num_frames, 5)
+                # Sample and hold for the camera too: each frame gets the latest image at that time
+                images = None
+                if self.camera_topic:
+                    frame_image_idx = np.clip(np.searchsorted(i_times, target_times, side='right') - 1, 0, None)
+                    images = self._iter_frame_images(episode_dir, frame_image_idx)
                 # Add only this episode's own frames; LeRobot handles variable episode lengths
                 # (out-of-episode action chunk steps are masked via action_is_pad during training)
                 for i in range(num_frames):
-                    self.dataset.add_frame({
+                    frame = {
                         "observation.state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
                         "observation.environment_state": torch.tensor(j_pos_sampled[i], dtype=torch.float32),
                         "action": torch.tensor(a_pos_full[i], dtype=torch.float32),
                         "task": self.task_name,
-                    })
+                    }
+                    if images is not None:
+                        frame[self.image_key] = next(images)
+                    self.dataset.add_frame(frame)
                 print(f"Saving episode {idx}...")
                 self.dataset.save_episode()
                 print(f"Episode {idx} saved successfully")

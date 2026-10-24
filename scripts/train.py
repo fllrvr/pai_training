@@ -29,8 +29,12 @@ Usage:
 
 
 from pathlib import Path
+import csv
 import importlib.util
 import shutil
+import time
+import matplotlib
+import matplotlib.pyplot as plt
 import wandb
 import torch
 import yaml
@@ -39,6 +43,8 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.act.configuration_act import ACTConfig
 from lerobot.common.policies.act.modeling_act import ACTPolicy
 from lerobot.configs.types import FeatureType
+
+matplotlib.use("Agg")
 
 def load_config_py(config_path: Path):
     spec = importlib.util.spec_from_file_location("crane_features", config_path)
@@ -49,6 +55,37 @@ def load_config_py(config_path: Path):
 def load_train_config(yaml_path: Path):
     with open(yaml_path, 'r') as f:
         return yaml.safe_load(f)
+
+def build_delta_timestamps(base: dict, chunk_size: int, fps: int) -> dict:
+    """Add the action timestamps to the observation ones from the YAML.
+
+    ACT predicts chunk_size future actions starting at the current frame, spaced 1/fps:
+    [0, 1/fps, ..., (chunk_size - 1)/fps].
+    """
+    delta_timestamps = dict(base)
+    delta_timestamps["action"] = [i / fps for i in range(chunk_size)]
+    print(f"action delta_timestamps: {chunk_size} steps "
+          f"(0.0 .. {delta_timestamps['action'][-1]:.2f} s at {fps} Hz)")
+    return delta_timestamps
+
+def open_train_log(log_path: Path):
+    """Open the loss log CSV (readable without wandb) and write the header. Returns (file, writer)."""
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["step", "loss", "elapsed_s"])
+    return log_file, log_writer
+
+def save_loss_plot(steps: list, losses: list, plot_path: Path):
+    """Save the loss curve (log scale) as an image."""
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(steps, losses)
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plot_path)
+    plt.close(fig)
 
 # =====================
 # Load parameters from YAML
@@ -77,7 +114,8 @@ def main():
     config = load_config_py(CONFIG_PATH)
     features = config.features
 
-    wandb.init(project="pai_crane_gazebo", config={
+    # dir: wandb's local files (e.g. offline runs with WANDB_MODE=offline) go under the output directory
+    wandb.init(project="pai_crane_gazebo", dir=OUTPUT_DIRECTORY, config={
         "repo_id": REPO_ID,
         "dataset_root": DATASET_ROOT,
         "training_steps": TRAINING_STEPS,
@@ -104,8 +142,14 @@ def main():
     policy.train()
     policy.to(DEVICE)
 
+    delta_timestamps = build_delta_timestamps(
+        DELTA_TIMESTAMPS,
+        CHUNK_SIZE,
+        dataset_metadata.fps,
+    )
+
     # Instantiate the dataset
-    dataset = LeRobotDataset(REPO_ID, root=DATASET_ROOT, delta_timestamps=DELTA_TIMESTAMPS)
+    dataset = LeRobotDataset(REPO_ID, root=DATASET_ROOT, delta_timestamps=delta_timestamps)
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE)
     dataloader = torch.utils.data.DataLoader(
@@ -117,14 +161,23 @@ def main():
         drop_last=True,
     )
 
+    # Loss log saved next to the checkpoint (readable without wandb)
+    log_path = OUTPUT_DIRECTORY / "train_log.csv"
+    log_file, log_writer = open_train_log(log_path)
+    log_steps, log_losses = [], []
+    start_time = time.time()
+
     step = 0
     done = False
     while not done:
         for batch in dataloader:
             batch = {k: (v.to(DEVICE) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             # Remove the sequence_length dimension to adapt to the ACT model implementation
-            batch["observation.state"] = batch["observation.state"][:, -1, :]  # (B, D)
-            batch["observation.environment_state"] = batch["observation.environment_state"][:, -1, :]  # (B, D)
+            # (state: (B, 1, D) -> (B, D)). Video frames with a single timestamp already come
+            # without it ((B, C, H, W)), so only inputs with one extra dimension are squeezed.
+            for key, ft in input_features.items():
+                if key in DELTA_TIMESTAMPS and batch[key].ndim == len(ft.shape) + 2:
+                    batch[key] = batch[key][:, -1]
             # action is left as is
             loss, _ = policy.forward(batch)
             loss.backward()
@@ -132,12 +185,21 @@ def main():
             optimizer.zero_grad()
 
             if step % LOG_FREQ == 0:
-                print(f"step: {step} loss: {loss.item():.3f}")
+                elapsed = time.time() - start_time
+                print(f"step: {step} loss: {loss.item():.3f} elapsed: {elapsed:.1f}s")
                 wandb.log({"loss": loss.item(), "step": step})
+                log_writer.writerow([step, loss.item(), round(elapsed, 2)])
+                log_file.flush()
+                log_steps.append(step)
+                log_losses.append(loss.item())
             step += 1
             if step >= TRAINING_STEPS:
                 done = True
                 break
+
+    log_file.close()
+    save_loss_plot(log_steps, log_losses, OUTPUT_DIRECTORY / "loss.png")
+    print(f"loss log saved to {log_path}")
 
     policy.save_pretrained(OUTPUT_DIRECTORY)
     # Keep the training hyperparameters (lr, delta_timestamps, etc.) alongside the checkpoint

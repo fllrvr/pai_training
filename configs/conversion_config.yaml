@@ -1,4 +1,9 @@
-bag_dir: "/workspace/dataset/rosbags/pick_and_move"
-output_dir: "/workspace/dataset/lerobot_dataset/crane_plus_pick_and_move"
-config: "configs/crane_features.py"
+bag_dir: "/workspace/dataset/rosbags/pick_and_move_camera"
+output_dir: "/workspace/dataset/lerobot_dataset/crane_plus_pick_and_move_camera"
+config: "configs/crane_features_camera.py"
 target_freq: 20
+
+# Without camera (original):
+# bag_dir: "/workspace/dataset/rosbags/pick_and_move"
+# output_dir: "/workspace/dataset/lerobot_dataset/crane_plus_pick_and_move"
+# config: "configs/crane_features.py"

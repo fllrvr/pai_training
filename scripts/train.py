@@ -31,6 +31,7 @@ Usage:
 from pathlib import Path
 import csv
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from lerobot.common.datasets.factory import resolve_delta_timestamps
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.factory import get_policy_class, make_policy_config
+from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 
@@ -88,6 +90,23 @@ def save_run_info(output_dir: Path, files_to_copy: list[Path]):
     code_dir.mkdir(exist_ok=True)
     for path in files_to_copy:
         shutil.copy(path, code_dir / path.name)
+
+def save_checkpoint(policy: PreTrainedPolicy, output_dir: Path, step: int, train_config_path: Path):
+    """Save the policy to output_dir, replacing the previous checkpoint (Diffusion models are ~1 GB each).
+
+    The files are first written to a temporary directory and then moved into place, so that a run killed
+    while saving still leaves the previous checkpoint intact.
+    """
+    tmp_dir = output_dir / ".checkpoint_tmp"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    policy.save_pretrained(tmp_dir)
+    # Keep the training hyperparameters (lr, policy parameters, etc.) alongside the checkpoint
+    shutil.copy(train_config_path, tmp_dir / "train_config.yaml")
+    (tmp_dir / "checkpoint_step.txt").write_text(f"{step}\n")
+    for path in tmp_dir.iterdir():
+        os.replace(path, output_dir / path.name)
+    tmp_dir.rmdir()
+    print(f"checkpoint (step {step}) saved to {output_dir}")
 
 def load_config_py(config_path: Path):
     spec = importlib.util.spec_from_file_location("crane_features", config_path)
@@ -158,6 +177,8 @@ CONFIG_PATH = Path(train_cfg["config_path"])
 DEVICE = torch.device(train_cfg["device"])
 TRAINING_STEPS = train_cfg["training_steps"]
 LOG_FREQ = train_cfg["log_freq"]
+# Save a checkpoint every save_freq steps (null or 0: only at the end)
+SAVE_FREQ = train_cfg.get("save_freq") or 0
 NUM_WORKERS = train_cfg["num_workers"]
 BATCH_SIZE = train_cfg["batch_size"]
 LEARNING_RATE = train_cfg["learning_rate"]
@@ -213,6 +234,9 @@ def main():
         shuffle=True,
         pin_memory=False,
         drop_last=True,
+        # Keep the worker processes across epochs. Re-creating them at every epoch causes a memory spike
+        # (each worker loads torch and the video decoders), which got the run killed at the first epoch end.
+        persistent_workers=NUM_WORKERS > 0,
     )
 
     # Loss log saved next to the checkpoint (readable without wandb)
@@ -245,15 +269,14 @@ def main():
             if step >= TRAINING_STEPS:
                 done = True
                 break
+            if SAVE_FREQ and step % SAVE_FREQ == 0:
+                save_checkpoint(policy, OUTPUT_DIRECTORY, step, TRAIN_CONFIG_PATH)
 
     log_file.close()
     save_loss_plot(log_steps, log_losses, OUTPUT_DIRECTORY / "loss.png")
     print(f"loss log saved to {log_path}")
 
-    policy.save_pretrained(OUTPUT_DIRECTORY)
-    # Keep the training hyperparameters (lr, delta_timestamps, etc.) alongside the checkpoint
-    shutil.copy(TRAIN_CONFIG_PATH, OUTPUT_DIRECTORY / "train_config.yaml")
-    print(f"policy saved to {OUTPUT_DIRECTORY}")
+    save_checkpoint(policy, OUTPUT_DIRECTORY, step, TRAIN_CONFIG_PATH)
     wandb.finish()
 
 if __name__ == "__main__":

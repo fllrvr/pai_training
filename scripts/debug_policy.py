@@ -2,8 +2,15 @@ import argparse
 import torch
 from pathlib import Path
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.policies.act.modeling_act import ACTPolicy
+from lerobot.common.policies.factory import get_policy_class
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.configs.policies import PreTrainedConfig
 import matplotlib.pyplot as plt
+
+def load_policy(policy_path: str) -> PreTrainedPolicy:
+    """Load a trained policy of any type (ACT, Diffusion, ...) using the type saved in its config.json."""
+    policy_type = PreTrainedConfig.from_pretrained(policy_path).type
+    return get_policy_class(policy_type).from_pretrained(policy_path)
 
 class EpisodeSampler(torch.utils.data.Sampler):
     def __init__(self, dataset: LeRobotDataset, episode_index: int):
@@ -34,9 +41,12 @@ def main():
     sampler = EpisodeSampler(dataset, args.episode_index)
 
     # Load the policy
-    policy = ACTPolicy.from_pretrained(args.policy_path)
+    policy = load_policy(args.policy_path)
     policy.to(args.device)
     policy.eval()
+    # Clear the action queue (and Diffusion's observation history) before the episode
+    policy.reset()
+    print(f"Loaded policy: {policy.config.type}")
 
     # Evaluate the policy
     errors = []
@@ -44,11 +54,12 @@ def main():
     gt_actions = []
     for i in sampler:
         sample = dataset[i]
+        # Pass every input the policy was trained with (state, environment_state, camera images, ...)
         obs = {
-            "observation.state": torch.tensor(sample["observation.state"], dtype=torch.float32).unsqueeze(0).to(args.device),
-            "observation.environment_state": torch.tensor(sample["observation.environment_state"], dtype=torch.float32).unsqueeze(0).to(args.device),
+            key: sample[key].to(torch.float32).unsqueeze(0).to(args.device)
+            for key in policy.config.input_features
         }
-        gt_action = torch.tensor(sample["action"], dtype=torch.float32).to(args.device)
+        gt_action = sample["action"].to(torch.float32).to(args.device)
 
         with torch.no_grad():
             pred_action = policy.select_action(obs).squeeze(0)

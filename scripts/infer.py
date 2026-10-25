@@ -7,23 +7,33 @@ import torch
 import argparse
 import numpy as np
 
-from lerobot.common.policies.act.modeling_act import ACTPolicy
+from lerobot.common.policies.factory import get_policy_class
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.configs.policies import PreTrainedConfig
 # Same image preprocessing as the dataset conversion
 from rosbag2lerobot import decode_image
 
 ARM_JOINT_NAMES = ['crane_plus_joint1', 'crane_plus_joint2', 'crane_plus_joint4', 'crane_plus_joint3']
 GRIPPER_JOINT_NAME = 'crane_plus_joint_hand'
 
+def load_policy(model_path: str) -> PreTrainedPolicy:
+    """Load a trained policy of any type (ACT, Diffusion, ...) using the type saved in its config.json."""
+    policy_type = PreTrainedConfig.from_pretrained(model_path).type
+    return get_policy_class(policy_type).from_pretrained(model_path)
+
 class InferenceNode(Node):
     def __init__(self, model_path, camera_topic):
-        super().__init__('crane_plus_act_infer')
+        super().__init__('crane_plus_policy_infer')
         self.arm_pub = self.create_publisher(JointTrajectory, '/crane_plus_arm_controller/joint_trajectory', 10)
         self.gripper_pub = self.create_publisher(JointTrajectory, '/crane_plus_gripper_controller/joint_trajectory', 10)
         self.subscription = self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
-        self.policy = ACTPolicy.from_pretrained(model_path)
+        self.policy = load_policy(model_path)
         self.policy.eval()
         self.device = torch.device('cpu')
         self.policy.to(self.device)
+        # Clear the action queue (and Diffusion's observation history) before starting
+        self.policy.reset()
+        print(f"Policy: {self.policy.config.type} from {model_path}")
         self.last_action = np.zeros(5, dtype=np.float32)
         self.timer = self.create_timer(0.05, self.publish_action)  # 20Hz
         self.latest_joint_state = None
@@ -56,7 +66,7 @@ class InferenceNode(Node):
             return
         if self.image_key and self.latest_image is None:
             return
-        # Prepare observation dict for ACTPolicy
+        # Prepare observation dict for the policy (current frame only; Diffusion keeps its own history)
         obs = {
             'observation.state': torch.tensor(self.latest_joint_state, dtype=torch.float32).unsqueeze(0),  # (1, 5)
             'observation.environment_state': torch.tensor(self.latest_joint_state, dtype=torch.float32).unsqueeze(0),  # (1, 5)
@@ -88,8 +98,8 @@ class InferenceNode(Node):
         print("action:", action[:4], "gripper:", action[4])
 
 def main():
-    parser = argparse.ArgumentParser(description='ACTPolicy inference node for CRANE+ V2 (ROS2)')
-    parser.add_argument('--model-path', type=str, required=True, help='Path to trained ACTPolicy model directory')
+    parser = argparse.ArgumentParser(description='Policy (ACT / Diffusion) inference node for CRANE+ V2 (ROS2)')
+    parser.add_argument('--model-path', type=str, required=True, help='Path to trained policy model directory')
     parser.add_argument('--camera-topic', type=str, default='/image_raw',
                         help='Camera topic (used only if the model was trained with images)')
     args = parser.parse_args()

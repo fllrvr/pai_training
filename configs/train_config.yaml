@@ -10,8 +10,10 @@ config_path: "configs/crane_features_camera.py"
 # config_path: "configs/crane_features.py"
 
 device: "cpu"
-training_steps: 2000
+training_steps: 1000
 log_freq: 10
+# Save the model every save_freq steps, overwriting the previous one (null: only at the end)
+save_freq: 500
 num_workers: 2
 batch_size: 8
 learning_rate: 0.0001

@@ -42,13 +42,15 @@ class RosbagToLeRobot:
         self.target_freq = target_freq
 
         # Find all episode directories (containing .db3 and metadata.yaml)
+        # episode_index follows this order. Names are sorted as strings, so ep10 comes before ep2
+        # (use zero-padded names such as ep00, ep01, ... to keep the numbers in order).
         self.episode_dirs = sorted(p.parent for p in self.bag_path.rglob('*.db3'))
         if not self.episode_dirs:
             raise FileNotFoundError(f"No rosbag2 episode directories found in {bag_dir}")
 
         print(f"Found {len(self.episode_dirs)} episode directories")
-        for ep_dir in self.episode_dirs:
-            print(f"  - {ep_dir}")
+        for idx, ep_dir in enumerate(self.episode_dirs):
+            print(f"  - episode {idx}: {ep_dir}")
 
         if config_path.endswith('.py'):
             config = load_config_py(config_path)

@@ -25,6 +25,8 @@ Convert rosbag2 to LeRobotDataset v2.1 format
 ```bash
 pixi run convert
 ```
+Note: episodes are numbered in the order of the rosbag folder names sorted as strings (e.g. `ep10` comes before `ep2`).
+Use zero-padded names (`ep00`, `ep01`, ...) to keep the numbers in order. The mapping is printed at the start of the conversion.
 Visualize the dataset
 ```bash
 pixi run python scripts/visualize_dataset.py --root /home/ubuntu/dataset/lerobot_dataset/crane_plus_pekori --repo-id crane_plus_pekori --episode-index 1 --mode distant
